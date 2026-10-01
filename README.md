@@ -31,7 +31,7 @@ Meet **Mochi**: a soft little squircle with big eyes that pops out of your notch
 
 ## Features
 
- 🟢 **Codex, live too** — the same live session view and notch approvals for Codex, next to Claude Code. Install the hooks, trust them once with `/hooks`, done.
+- 🟢 **Codex, live too** — a separate session pill and explicit **Allow / Deny** approvals. Install the hooks, then review and trust them in Codex with `/hooks`.
 - ✅ **Approve from the notch** — Claude Code permission requests show up with **Allow / Deny**. One click, back to work.
 - 🧑‍💻 **Jump to the right terminal** — open the exact terminal window of a session *(macOS)*.
 - 💬 **Ask Claude anything** — built-in chat, straight from the notch.
@@ -99,11 +99,11 @@ Click the Coucou icon in the menu bar (macOS) or in the system tray (Windows) �
 
 | What | Why | Where the key goes |
 |---|---|---|
-| **Codex hooks** | live Codex sessions and approvals | **Install hooks** — Coucou backs up `~/.codex/hooks.json`, merges its hooks, shows you the diff, then run `/hooks` in Codex to trust them |
+| **Codex hooks** | live Codex sessions and approvals | **Install hooks** — Coucou previews and merges `hooks.json` in your Codex home (usually `~/.codex`), makes a dated backup, then asks you to review and trust the hooks with `/hooks` in Codex |
 | **Anthropic API key** | chat and questions about files | Keychain / Windows Credential Manager |
 | Stripe, n8n, GitHub, Vercel, Resend, Notion, Cal.com | the integration pills | Keychain / Windows Credential Manager, all optional |
 
-If Coucou isn't running, the hook exits immediately: **Claude Code is never blocked.**
+If Coucou isn't running, event hooks exit promptly and approval hooks return no decision, so the agent keeps its own approval prompt.
 
 ## Things to try
 

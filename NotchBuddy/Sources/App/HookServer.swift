@@ -30,17 +30,11 @@ final class HookServer: @unchecked Sendable {
     // Codex reads hooks from ~/.codex/hooks.json (or inline [hooks] tables in config.toml).
     // Coucou writes hooks.json only — it never touches the user's config.toml.
     static var codexHooksURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/hooks.json")
-    }
-    static var codexHookScriptPath: String {
-        #if APPSTORE
-        // Written to ~/.codex/coucou/nb-hook via security-scoped bookmark during hook installation
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/coucou/nb-hook").path
-        #else
-        return supportDir.appendingPathComponent("nb-hook").path
-        #endif
+        let home = ProcessInfo.processInfo.environment["CODEX_HOME"]
+            .flatMap { $0.isEmpty ? nil : $0 }
+            .map { URL(fileURLWithPath: NSString(string: $0).expandingTildeInPath) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+        return home.appendingPathComponent("hooks.json")
     }
 
     // No approval blocking state — notch is notification-only, user answers in VS Code
@@ -48,7 +42,7 @@ final class HookServer: @unchecked Sendable {
     private var serverFD: Int32 = -1
     private var pendingApprovalFD: Int32 = -1   // held open while user decides
     private var pendingApprovalTaskId: String = "integration_claude"  // pill that owns the pending approval
-    private var activeSessionId: String? = nil  // current Claude Code session
+    @MainActor var isCodexApproval: Bool { pendingApprovalFD >= 0 && pendingApprovalTaskId == "integration_codex" }
 
     private init() {}
 
@@ -125,6 +119,10 @@ final class HookServer: @unchecked Sendable {
         // nb-hook tells us which agent it was installed for ("claude" when no argument is passed).
         // Named coucou_agent so it can't collide with Claude's and Codex's own agent_id/agent_type.
         let agent = payload["coucou_agent"] as? String ?? "claude"
+        guard agent == "claude" || agent == "codex" else {
+            close(fd)
+            return
+        }
 
         if eventName == "PermissionRequest" {
             // Hold fd open — Claude Code waits for our decision (up to 120s)
@@ -167,7 +165,6 @@ final class HookServer: @unchecked Sendable {
         switch name {
 
         case "SessionStart":
-            activeSessionId = sessionId
             upsertTask(id: taskId, projectName: projectName, cwd: cwd)
             nbLog("SessionStart [\(agent)] \(projectName) (\(sessionId.prefix(8)))")
             // A real session start clears a pill left behind by a session that died without Stop.
@@ -180,7 +177,6 @@ final class HookServer: @unchecked Sendable {
             SoundEngine.shared.play("work")
 
         case "UserPromptSubmit":
-            activeSessionId = sessionId
             upsertTask(id: taskId, projectName: projectName, cwd: cwd)
             state.updateTask(id: taskId, state: .thinking)
             if let prompt = payload["prompt"] as? String, !prompt.isEmpty {
@@ -189,14 +185,13 @@ final class HookServer: @unchecked Sendable {
             if state.isPresent { expandIfNeeded(to: .overview) }
 
         case "PreToolUse":
-            activeSessionId = sessionId
             upsertTask(id: taskId, projectName: projectName, cwd: cwd)
             state.updateTask(id: taskId, state: .working)
             let tool = payload["tool_name"] as? String ?? "Tool"
             let input = payload["tool_input"] as? [String: Any] ?? [:]
             let step = frenchStep(tool: tool, input: input)
             appendStep(id: taskId, step: step, note: stepNote(input: input))
-            nbLog("PreToolUse [\(agent)] \(step)")
+            nbLog("PreToolUse [\(agent)] \(tool)")
 
         case "PostToolUse":
             // Codex can deliver a PostToolUse after the turn already ended (a write_stdin poll
@@ -244,8 +239,10 @@ final class HookServer: @unchecked Sendable {
                 setPillBadge(id: taskId, badge: .finished)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.2) {
-                state.updateTask(id: taskId, state: .idle)
-                self.clearPillBadge(id: taskId)
+                if state.tasks.first(where: { $0.id == taskId })?.state == .finished {
+                    state.updateTask(id: taskId, state: .idle)
+                    self.clearPillBadge(id: taskId)
+                }
             }
 
         case "StopFailure":
@@ -259,13 +256,11 @@ final class HookServer: @unchecked Sendable {
 
         case "Interrupt":
             // Codex only: the user stopped the turn
-            activeSessionId = nil
             state.updateTask(id: taskId, state: .idle)
             appendStep(id: taskId, step: "Interrompu")
             nbLog("Interrupt [\(agent)] \(projectName)")
 
         case "SessionEnd":
-            activeSessionId = nil
             state.updateTask(id: taskId, state: .idle)
             clearSession(id: taskId, isCodex: isCodex)
             nbLog("SessionEnd [\(agent)] \(projectName)")
@@ -334,19 +329,21 @@ final class HookServer: @unchecked Sendable {
             // Codex adds a human-readable approval reason when it has one
             command = input["command"] as? String ?? input["description"] as? String ?? tool
         }
-        nbLog("PermissionRequest [\(agent)] \(tool): \(command)")
+        nbLog("PermissionRequest [\(agent)] \(tool)")
 
         if pendingApprovalFD >= 0 {
             let old = pendingApprovalFD
+            let oldTaskId = pendingApprovalTaskId
             Task.detached { [weak self] in
                 // "ask" → nb-hook outputs nothing → Claude Code re-asks
                 self?.sendLine(fd: old, text: #"{"permissionDecision":"ask"}"#)
                 close(old)
             }
+            state.updateTask(id: oldTaskId, state: .working)
+            clearPillBadge(id: oldTaskId)
         }
         pendingApprovalFD = fd
         pendingApprovalTaskId = taskId
-        activeSessionId = sessionId
 
         upsertTask(id: taskId, projectName: projectName, cwd: cwd)
         state.updateTask(id: taskId, state: .approval)
@@ -724,55 +721,55 @@ final class HookServer: @unchecked Sendable {
     // Coucou only ever writes hooks.json, merged, after a dated backup — config.toml is left alone.
     // Reminder for the user: Codex asks them to review and trust non-managed hooks with /hooks.
 
-    /// Codex hook events and their timeout (seconds). Codex caps SessionEnd and Interrupt at 3s.
-    private static let codexHookEvents: [(String, Int)] = [
-        ("SessionStart", 10), ("SessionEnd", 3),
-        ("UserPromptSubmit", 10),
-        ("PreToolUse", 10), ("PostToolUse", 10),
-        ("PermissionRequest", 130),
-        ("Stop", 10),
-        ("SubagentStart", 10), ("SubagentStop", 10),
-        ("Interrupt", 3),
-    ]
-
     /// The command Coucou installs: nb-hook plus the "codex" argument that tags every payload.
-    private var codexHookCommand: String {
-        "\"\(Self.codexHookScriptPath.replacingOccurrences(of: "\"", with: "\\\""))\" codex"
+    private func codexHookCommand(codexDir: URL) -> String {
+        #if APPSTORE
+        let path = codexDir.appendingPathComponent("coucou/nb-hook").path
+        return "/bin/sh \"\(path.replacingOccurrences(of: "\"", with: "\\\""))\" codex"
+        #else
+        let path = Self.hookScriptPath
+        return "\"\(path.replacingOccurrences(of: "\"", with: "\\\""))\" codex"
+        #endif
     }
 
     /// True when ~/.codex/hooks.json already routes Codex events to Coucou.
     static func codexHooksInstalled() -> Bool {
-        guard let data = try? Data(contentsOf: codexHooksURL),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let hooks = json["hooks"] as? [String: Any] else { return false }
-        return hooks.values.contains { value in
-            (value as? [[String: Any]])?.contains { matcher in
-                Self.isCoucouMatcher(matcher)
-            } ?? false
-        }
-    }
-
-    private static func isCoucouMatcher(_ matcher: [String: Any]) -> Bool {
-        (matcher["hooks"] as? [[String: Any]])?.contains {
-            let cmd = $0["command"] as? String ?? ""
-            return cmd.contains("NotchBuddy") || cmd.contains("coucou")
-        } ?? false
+        #if APPSTORE
+        guard let bookmark = UserDefaults.standard.data(forKey: "codexDirectoryBookmark") else { return false }
+        var stale = false
+        guard let dir = try? URL(resolvingBookmarkData: bookmark, options: .withSecurityScope,
+                                 relativeTo: nil, bookmarkDataIsStale: &stale), !stale else { return false }
+        let accessing = dir.startAccessingSecurityScopedResource()
+        defer { if accessing { dir.stopAccessingSecurityScopedResource() } }
+        let hooksURL = dir.appendingPathComponent("hooks.json")
+        #else
+        let hooksURL = codexHooksURL
+        let dir = hooksURL.deletingLastPathComponent()
+        #endif
+        return CodexHooksConfig.containsManagedHook(
+            try? Data(contentsOf: hooksURL),
+            command: shared.codexHookCommand(codexDir: dir)
+        )
     }
 
     private var _pendingCodexHooksData: Data?
+    private var _pendingCodexOriginalData: Data?
+    private var _pendingCodexDir: URL?
 
     /// Returns the merged hooks.json without writing — call writeCodexHooks() to confirm.
     func previewCodexHooks() throws -> String {
-        let data = try buildCodexHooksData(codexDir: Self.codexHooksURL.deletingLastPathComponent())
-        _pendingCodexHooksData = data
+        let dir = Self.codexHooksURL.deletingLastPathComponent()
+        let data = try buildCodexHooksData(codexDir: dir)
         return String(data: data, encoding: .utf8) ?? ""
     }
 
     /// Writes hooks.json to disk (call after the user confirms the preview).
     func writeCodexHooks() throws {
-        guard let data = _pendingCodexHooksData else { return }
-        try writeCodexHooksFile(data: data, codexDir: Self.codexHooksURL.deletingLastPathComponent())
+        guard let data = _pendingCodexHooksData, let dir = _pendingCodexDir else { return }
+        try writeCodexHooksFile(data: data, codexDir: dir)
         _pendingCodexHooksData = nil
+        _pendingCodexOriginalData = nil
+        _pendingCodexDir = nil
     }
 
     func uninstallCodexHooks() throws {
@@ -782,50 +779,50 @@ final class HookServer: @unchecked Sendable {
     private func writeCodexHooksFile(data: Data, codexDir: URL) throws {
         try FileManager.default.createDirectory(at: codexDir, withIntermediateDirectories: true)
         let hooksURL = codexDir.appendingPathComponent("hooks.json")
-        if FileManager.default.fileExists(atPath: hooksURL.path) {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyyMMdd-HHmm"
-            let backupURL = codexDir.appendingPathComponent("hooks.json.bak-\(formatter.string(from: Date()))")
-            try? FileManager.default.copyItem(at: hooksURL, to: backupURL)
+        guard codexDir.standardizedFileURL == _pendingCodexDir?.standardizedFileURL,
+              try readExisting(hooksURL) == _pendingCodexOriginalData else {
+            throw CodexHooksConfig.ConfigError.changedSincePreview
         }
+        try backupIfExisting(hooksURL)
         try data.write(to: hooksURL, options: .atomic)
     }
 
     private func buildCodexHooksData(codexDir: URL) throws -> Data {
         let hooksURL = codexDir.appendingPathComponent("hooks.json")
-        var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: hooksURL),
-           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            root = parsed
-        }
-        var hooks = root["hooks"] as? [String: Any] ?? [:]
-        for (event, timeout) in Self.codexHookEvents {
-            var existing = hooks[event] as? [[String: Any]] ?? []
-            existing.removeAll { Self.isCoucouMatcher($0) }
-            existing.append(["hooks": [["type": "command", "command": codexHookCommand, "timeout": timeout]]])
-            hooks[event] = existing
-        }
-        root["hooks"] = hooks
-        return try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        let original = try readExisting(hooksURL)
+        let result = try CodexHooksConfig.merged(existing: original, command: codexHookCommand(codexDir: codexDir))
+        _pendingCodexHooksData = result
+        _pendingCodexOriginalData = original
+        _pendingCodexDir = codexDir
+        return result
     }
 
     /// Removes only the Coucou matchers from a hooks.json file, leaving other hooks untouched.
     private func removeCoucouHooks(at hooksURL: URL) throws {
-        guard let data = try? Data(contentsOf: hooksURL),
-              var root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              var hooks = root["hooks"] as? [String: Any] else { return }
-
-        for key in hooks.keys {
-            guard var matchers = hooks[key] as? [[String: Any]] else { continue }
-            matchers.removeAll { Self.isCoucouMatcher($0) }
-            if matchers.isEmpty { hooks.removeValue(forKey: key) }
-            else { hooks[key] = matchers }
-        }
-        if hooks.isEmpty { root.removeValue(forKey: "hooks") }
-        else { root["hooks"] = hooks }
-
-        let newData = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        guard let data = try readExisting(hooksURL) else { return }
+        let newData = try CodexHooksConfig.removing(
+            existing: data,
+            command: codexHookCommand(codexDir: hooksURL.deletingLastPathComponent())
+        )
+        try backupIfExisting(hooksURL)
         try newData.write(to: hooksURL, options: .atomic)
+    }
+
+    private func readExisting(_ url: URL) throws -> Data? {
+        do { return try Data(contentsOf: url) }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+            return nil
+        }
+    }
+
+    private func backupIfExisting(_ url: URL) throws {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let backupURL = url.deletingLastPathComponent().appendingPathComponent(
+            "hooks.json.bak-\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(8))"
+        )
+        try FileManager.default.copyItem(at: url, to: backupURL)
     }
 
     // MARK: - App Store: hooks via security-scoped bookmark
@@ -898,8 +895,10 @@ final class HookServer: @unchecked Sendable {
         let coucouDir = codexURL.appendingPathComponent("coucou")
         try FileManager.default.createDirectory(at: coucouDir, withIntermediateDirectories: true)
         let scriptURL = coucouDir.appendingPathComponent("nb-hook")
-        try nbHookScriptAppStore.write(to: scriptURL, atomically: true, encoding: .utf8)
-        _ = try? FileManager.default.setAttributes([.posixPermissions: 0o755 as NSNumber], ofItemAtPath: scriptURL.path)
+        try nbHookShellWrapper.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755 as NSNumber], ofItemAtPath: scriptURL.path)
+        let pythonURL = coucouDir.appendingPathComponent("nb-hook.py")
+        try nbHookPythonAppStore.write(to: pythonURL, atomically: true, encoding: .utf8)
 
         try writeCodexHooksFile(data: data, codexDir: codexURL)
         _pendingCodexHooksData = nil
@@ -963,7 +962,7 @@ private let nbHookShellWrapper = """
 # Coucou hook relay — always exits 0, never blocks Claude Code
 HOOK_DIR="$(dirname "$0")"
 if xcode-select -p >/dev/null 2>&1; then
-    out=$(/usr/bin/python3 "$HOOK_DIR/nb-hook.py" 2>/dev/null)
+    out=$(/usr/bin/python3 "$HOOK_DIR/nb-hook.py" "$@" 2>/dev/null)
     rc=$?
     if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
         printf '%s\\n' "$out"
@@ -1005,7 +1004,7 @@ def main():
         agent = args[1]
     else:
         agent = args[0] if args else 'claude'
-    payload.setdefault('coucou_agent', agent)
+    payload['coucou_agent'] = agent
     socket_path = os.path.expanduser(
         '~/Library/Application Support/NotchBuddy/nb.sock'
     )
@@ -1109,7 +1108,7 @@ def main():
         agent = args[1]
     else:
         agent = args[0] if args else 'claude'
-    payload.setdefault('coucou_agent', agent)
+    payload['coucou_agent'] = agent
     socket_path = os.path.expanduser(
         '~/Library/Containers/fr.louisraille.Coucou/Data/nb.sock'
     )

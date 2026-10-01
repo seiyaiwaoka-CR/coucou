@@ -9,6 +9,10 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scheme: [NotchBuddy, CoucouAppStore]
     steps:
       - uses: actions/checkout@v4
 
@@ -18,12 +22,15 @@ jobs:
       - name: Generate project
         run: cd NotchBuddy && xcodegen
 
-      - name: Build
+      - name: Build ${{ matrix.scheme }} without signing
         run: |
           xcodebuild \
             -project NotchBuddy/NotchBuddy.xcodeproj \
-            -scheme NotchBuddy \
+            -scheme "${{ matrix.scheme }}" \
             -configuration Release \
             build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO
+
+      - name: Codex hook regression checks
+        run: python3 tests/test_codex_hooks.py

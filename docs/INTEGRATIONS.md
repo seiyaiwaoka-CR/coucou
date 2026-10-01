@@ -70,8 +70,8 @@ Demande l'autorisation Automatisation la première fois (normal).
 ## 1bis. Codex (sessions de Louis)
 
 Règle d'or identique : **vérifier la doc officielle au moment d'implémenter**.
-- Hooks Codex : https://developers.openai.com/codex/hooks (version markdown : ajouter `.md` à l'URL)
-- Emplacement des hooks : `~/.codex/hooks.json`, ou tables `[hooks]` en ligne dans `~/.codex/config.toml`
+- Hooks Codex : https://learn.chatgpt.com/docs/hooks
+- Emplacement des hooks : `hooks.json` dans le dossier Codex (`~/.codex` par défaut, `CODEX_HOME` si défini), ou tables `[hooks]` en ligne dans `config.toml`.
 
 ### Architecture
 ```
@@ -80,8 +80,8 @@ codex (terminal, app Codex)
                          └─ socket Unix ─► Notch Buddy.app
                          ◄─ décision (pour PermissionRequest)
 ```
-- **Même socket, même script, même protocole** que Claude Code. `nb-hook` reçoit l'agent en `argv[1]` (« claude » par défaut, « codex » ici) et l'ajoute au JSON sous `agent` ; l'app route alors vers la pill `integration_codex` au lieu de `integration_claude`.
-- Notch Buddy écrit **uniquement** `~/.codex/hooks.json` (fusion + sauvegarde datée + JSON montré avant écriture). Il ne touche **jamais** `config.toml` : les tables `[hooks]` en ligne et le reste de la config de Louis restent intacts.
+- **Même socket et même relais** que Claude Code. Le wrapper transmet `codex` au script Python ; ce dernier écrit `coucou_agent` dans le JSON et l'app route vers la pill `integration_codex`.
+- Coucou écrit **uniquement** `hooks.json` dans le dossier Codex choisi (fusion + sauvegarde datée + JSON montré avant écriture). Il ne touche **jamais** `config.toml` ; il refuse un JSON invalide ou un fichier modifié depuis la prévisualisation.
 - Si l'app ne répond pas, `nb-hook` sort en code 0 sans rien écrire : Codex n'est jamais bloqué.
 
 ### Événements branchés et état du bonhomme
@@ -106,22 +106,21 @@ Timeouts écrits dans `hooks.json` : 10 s partout, 3 s pour `SessionEnd` et `Int
 
 ### Approuver depuis le notch
 - Sur `PermissionRequest`, `nb-hook` **attend** la décision de l'app puis écrit sur stdout `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow|deny"}}}`.
-- « Toujours autoriser » est renvoyé comme un simple `allow` : Codex **fail closed** sur `updatedPermissions` et `updatedInput` pour `PermissionRequest` (la doc l'interdit explicitement). La règle persistante reste donc à créer côté Codex.
+- Codex affiche seulement **Allow** et **Deny**. Les règles persistantes se gèrent dans Codex ; `PermissionRequest` n'accepte pas `updatedPermissions` ni `updatedInput`.
 - Pas de réponse dans le délai, app fermée, ou décision `ask` → aucune sortie : Codex garde son invite d'approbation normale.
 - Sur `PreToolUse`, `permissionDecision: ask` n'est pas supporté par Codex (l'appel de hook échoue sans bloquer l'outil) : ne pas s'en servir.
 
 ### Installation des hooks : procédure obligatoire
-1. Lire `~/.codex/hooks.json` (le créer s'il n'existe pas).
-2. Copier en `~/.codex/hooks.json.bak-AAAAMMJJ-HHMM`.
+1. Lire `hooks.json` dans le dossier Codex (le créer s'il n'existe pas).
+2. Copier le fichier existant en `hooks.json.bak-AAAAMMJJ-HHMMSS-<suffixe>` avant toute écriture.
 3. **Fusionner** : ajouter les matchers Notch Buddy sans toucher aux autres hooks ; ne retirer que nos propres entrées.
 4. Montrer le JSON à Louis, attendre son OK, écrire.
 5. Bouton « Uninstall » dans les réglages qui retire uniquement les entrées Notch Buddy.
-6. **Étape utilisateur obligatoire** : les hooks non gérés doivent être relus et approuvés une fois — `/hooks` dans Codex. Tant qu'ils ne le sont pas, Codex les ignore (avertissement au démarrage). Pour un usage ponctuel : `codex exec --dangerously-bypass-hook-trust`.
+6. **Étape utilisateur obligatoire** : les hooks non gérés doivent être relus et approuvés dans `/hooks` dans Codex. Tant qu'ils ne le sont pas, Codex les ignore.
 
-### Vérifié le 30/09/2026 (codex-cli 0.146.0, macOS)
-- Codex charge bien `~/.codex/hooks.json` et déclenche `SessionStart`, `UserPromptSubmit`, `SessionEnd`.
-- Le `command` est exécuté par le shell : `"…/nb-hook" codex` → `argv[1] == "codex"`.
-- `allow`, `deny`, `ask` et l'absence de réponse produisent exactement le JSON attendu par la doc.
+### Vérification locale
+- Contrôles isolés : relais shell/Python avec faux socket pour Allow, Deny et app indisponible ; fusion et retrait de hooks sur fixtures JSON ; typecheck Swift des deux variantes.
+- Les essais Codex CLI 0.146.0 et desktop 0.155.0-alpha décrits par l'auteur de la PR d'origine ne constituent pas une validation indépendante de cette intégration. L'utilisation dans la vraie app et le dialogue d'approbation restent à vérifier après compilation et installation par l'utilisateur.
 
 ## 2. n8n (workflows de Louis)
 

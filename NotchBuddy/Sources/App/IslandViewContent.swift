@@ -210,8 +210,10 @@ struct ApprovalView: View {
                     PrimaryButton("Allow") {
                         HookServer.shared.sendApprovalDecision("allow")
                     }
-                    SecondaryButton("Always") {
-                        HookServer.shared.sendApprovalDecision("always")
+                    if !HookServer.shared.isCodexApproval {
+                        SecondaryButton("Always") {
+                            HookServer.shared.sendApprovalDecision("always")
+                        }
                     }
                 }
             }

@@ -133,7 +133,7 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         #if APPSTORE
                         if codexAccessGranted {
-                            Text("~/.codex/coucou/nb-hook")
+                            Text("Codex home/coucou/nb-hook")
                                 .font(.system(size: 11, design: .monospaced))
                                 .foregroundColor(.secondary)
                             HStack(spacing: 10) {
@@ -143,10 +143,10 @@ struct SettingsView: View {
                                     .buttonStyle(.bordered)
                             }
                         } else {
-                            Text("Choose your ~/.codex folder so Coucou can add its hooks.")
+                            Text("Choose your Codex home folder so Coucou can add its hooks.")
                                 .font(.system(size: 12))
                                 .foregroundColor(.secondary)
-                            Button("Choose .codex folder…") { chooseCodexFolder() }
+                            Button("Choose Codex home…") { chooseCodexFolder() }
                                 .buttonStyle(.borderedProminent)
                         }
                         #else
@@ -478,12 +478,16 @@ struct SettingsView: View {
 
     private func chooseCodexFolder() {
         let panel = NSOpenPanel()
-        panel.message = "Choose your .codex folder so Coucou can add its hooks"
+        panel.message = "Choose your Codex home folder (usually .codex)"
         panel.prompt = "Choose"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
+        // The sandbox's home points inside the app container, so start at the real account home.
+        let realHomePath = getpwuid(getuid()).flatMap { String(cString: $0.pointee.pw_dir, encoding: .utf8) }
+            ?? "/Users/\(NSUserName())"
+        panel.directoryURL = URL(fileURLWithPath: realHomePath)
+        panel.showsHiddenFiles = true
         if panel.runModal() == .OK, let url = panel.url {
             do {
                 let data = try url.bookmarkData(
@@ -493,7 +497,7 @@ struct SettingsView: View {
                 )
                 UserDefaults.standard.set(data, forKey: "codexDirectoryBookmark")
                 codexAccessGranted = true
-                statusMessage = "✓ .codex folder access granted."
+                statusMessage = "✓ Codex home access granted."
             } catch {
                 statusMessage = "❌ Bookmark error: \(error.localizedDescription)"
             }
@@ -540,7 +544,7 @@ struct SettingsView: View {
             try HookServer.shared.writeCodexHooksAppStore(codexURL: codexURL)
             showCodexDiff = false
             pendingCodexJSON = ""
-            statusMessage = "✓ Codex hooks installed in ~/.codex/hooks.json"
+            statusMessage = "✓ Codex hooks installed — run /hooks in Codex to review and trust them."
         } catch {
             statusMessage = "❌ Write error: \(error.localizedDescription)"
         }
