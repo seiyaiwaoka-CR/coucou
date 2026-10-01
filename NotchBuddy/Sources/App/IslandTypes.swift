@@ -31,6 +31,8 @@ enum BotEmote: String, CaseIterable {
 // MARK: - Approval info (pending PermissionRequest from Claude Code)
 
 struct ApprovalInfo: Sendable {
+    let requestId: UUID
+    let taskId: String
     var sessionId: String
     var tool: String
     var command: String

@@ -23,6 +23,7 @@ export interface AgentTask {
 
 export interface ApprovalInfo {
   requestId: string;
+  taskId: string;
   sessionId: string;
   tool: string;
   command: string;

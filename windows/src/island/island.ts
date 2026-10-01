@@ -19,6 +19,7 @@ import { USC, UploadSeq } from "../upload/sequence";
 import { buildHeader, buildViews, type ViewActions, type ViewHost } from "../views/views";
 import { h } from "../views/dom";
 import { IslandStateMachine } from "./fsm";
+import { decisionTask } from "./hookSafety";
 
 const BOT_OVERHANG = 40;
 /** Same margin as the Rust hit test (src-tauri/src/island.rs). */
@@ -134,17 +135,17 @@ export class Island {
       openUrl: (url) => {
         if (url) void Bridge.openUrl(url);
       },
-      decide: (d) => {
+      decide: (d, displayedRequestId) => {
         const req = State.pendingApproval;
-        void Bridge.log(`decide ${d} req=${req?.requestId ?? "none"}`);
-        if (!req) return;
+        const taskId = decisionTask(req, displayedRequestId);
+        if (!req || !taskId) return;
         Sound.play(d === "deny" ? "blip" : "approve");
         void Bridge.approvalDecision(req.requestId, d);
         State.pendingApproval = null;
         State.isPinned = false;
         this.fsm.pinned = false;
-        State.updateTask("integration_claude", "working");
-        State.setPillBadge("integration_claude", null);
+        State.updateTask(taskId, "working");
+        State.setPillBadge(taskId, null);
         this.setView(State.defaultView());
       },
       toggleSound: () => {

@@ -198,21 +198,29 @@ struct ApprovalView: View {
     var approval: ApprovalInfo? { state.pendingApproval }
 
     var body: some View {
+        let shownApproval = approval
         ZStack {
             CardBackground(wash: .amber)
             VStack(alignment: .leading, spacing: 5) {
-                AgentWho(task: state.focusTask, label: "needs permission")
-                CodeBlock(text: approval?.command ?? approval?.tool ?? "…")
+                AgentWho(task: state.tasks.first(where: { $0.id == shownApproval?.taskId }),
+                         label: "needs permission")
+                CodeBlock(text: shownApproval?.command ?? shownApproval?.tool ?? "…")
                 HStack(spacing: 8) {
                     SecondaryButton("Deny") {
-                        HookServer.shared.sendApprovalDecision("deny")
+                        if let requestId = shownApproval?.requestId {
+                            HookServer.shared.sendApprovalDecision("deny", requestId: requestId)
+                        }
                     }
                     PrimaryButton("Allow") {
-                        HookServer.shared.sendApprovalDecision("allow")
+                        if let requestId = shownApproval?.requestId {
+                            HookServer.shared.sendApprovalDecision("allow", requestId: requestId)
+                        }
                     }
-                    if !HookServer.shared.isCodexApproval {
+                    if shownApproval?.taskId == "integration_claude" {
                         SecondaryButton("Always") {
-                            HookServer.shared.sendApprovalDecision("always")
+                            if let requestId = shownApproval?.requestId {
+                                HookServer.shared.sendApprovalDecision("always", requestId: requestId)
+                            }
                         }
                     }
                 }

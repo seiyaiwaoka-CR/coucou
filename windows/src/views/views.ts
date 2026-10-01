@@ -11,6 +11,7 @@ import { createMiniBot, pruneMiniBots } from "../mochi/minibots";
 import { buildPrompt } from "./chat";
 import { buildChoose, buildUpload, buildUploading } from "./upload";
 import { renderIntegrationCard, type IntegrationCardHooks } from "./integrations";
+import { ApprovalClickBinding } from "../island/hookSafety";
 
 export interface ViewActions {
   setView(v: IslandViewName): void;
@@ -20,7 +21,7 @@ export interface ViewActions {
   /** The ↗ button: opens whatever the focused pill points at. */
   openTarget(): void;
   openUrl(url: string): void;
-  decide(d: "allow" | "deny"): void;
+  decide(d: "allow" | "deny", displayedRequestId: string | null): void;
   toggleSound(): void;
   setVolume(v: number): void;
   setAutoClose(seconds: number): void;
@@ -294,15 +295,27 @@ function buildApproval(actions: ViewActions): ViewHost {
   const row = h("div", { class: "actions" });
   const el = h("div", { class: "view" }, card("amber", stack(116, 16, who, code, row)));
   let rowKey = "";
+  const approvalButton = (label: string, kind: "primary" | "secondary", decision: "allow" | "deny", kbd: string) => {
+    const binding = new ApprovalClickBinding();
+    const button = btn(label, kind, () => {
+      actions.decide(decision, binding.release());
+    }, kbd);
+    button.addEventListener("pointerdown", () => binding.press());
+    approvalBindings.push(binding);
+    return button;
+  };
+  const approvalBindings: ApprovalClickBinding[] = [];
   return {
     el,
     sync() {
       clear(who);
-      who.append(agentWho(State.focusTask, "needs permission"));
+      who.append(agentWho(State.tasks.find((task) => task.id === State.pendingApproval?.taskId) ?? null,
+                          "needs permission"));
       // The whole point of approving here rather than in the terminal: this line
       // is the command, the file path or the URL being authorised, not just the
       // name of the tool asking.
       code.textContent = State.pendingApproval?.command || State.pendingApproval?.tool || "…";
+      for (const binding of approvalBindings) binding.show(State.pendingApproval?.requestId ?? null);
       // Two buttons, built once. Rebuilding them between a mouse-down and a
       // mouse-up would swallow the click, and there is nothing left to vary:
       // "Always" is gone until the remembered-rules list exists to back it.
@@ -310,8 +323,8 @@ function buildApproval(actions: ViewActions): ViewHost {
       rowKey = "built";
       clear(row);
       row.append(
-        btn("Deny", "secondary", () => actions.decide("deny"), "N"),
-        btn("Allow", "primary", () => actions.decide("allow"), "Y"),
+        approvalButton("Deny", "secondary", "deny", "N"),
+        approvalButton("Allow", "primary", "allow", "Y"),
       );
     },
   };

@@ -40,9 +40,8 @@ final class HookServer: @unchecked Sendable {
     // No approval blocking state — notch is notification-only, user answers in VS Code
 
     private var serverFD: Int32 = -1
-    private var pendingApprovalFD: Int32 = -1   // held open while user decides
-    private var pendingApprovalTaskId: String = "integration_claude"  // pill that owns the pending approval
-    @MainActor var isCodexApproval: Bool { pendingApprovalFD >= 0 && pendingApprovalTaskId == "integration_codex" }
+    @MainActor private var approvalSlot = HookApprovalSlot()
+    @MainActor private var sessionRouter = HookSessionRouter()
 
     private init() {}
 
@@ -159,6 +158,18 @@ final class HookServer: @unchecked Sendable {
             nbLog("Ignored \(name) from \(termProgram.isEmpty ? bundleId : termProgram) (\(projectName))")
             return
         }
+        if let pending = approvalSlot.request,
+           pending.taskId == taskId, pending.sessionId != sessionId { return }
+
+        let currentlyActive = state.tasks.first(where: { $0.id == taskId })
+            .map { $0.state != .idle && $0.state != .finished && $0.state != .error } ?? false
+        guard sessionRouter.accepts(taskId: taskId, sessionId: sessionId,
+                                    turnId: payload["turn_id"] as? String,
+                                    event: name, currentlyActive: currentlyActive) else { return }
+        if let pending = approvalSlot.request, pending.taskId == taskId,
+           ["UserPromptSubmit", "Stop", "Interrupt", "SessionEnd"].contains(name) {
+            sendApprovalDecision("ask", requestId: pending.id)
+        }
 
         let focused = state.focusId == taskId
 
@@ -170,7 +181,7 @@ final class HookServer: @unchecked Sendable {
             // A real session start clears a pill left behind by a session that died without Stop.
             // Codex also fires SessionStart mid-turn when it compacts (source = "compact"), and
             // that one must not interrupt a running turn.
-            if (payload["source"] as? String) != "compact" {
+            if (payload["source"] as? String) != "compact" && !currentlyActive {
                 state.updateTask(id: taskId, state: .idle)
             }
             if state.isPresent { expandIfNeeded(to: .overview) }
@@ -224,6 +235,7 @@ final class HookServer: @unchecked Sendable {
             }
 
         case "Stop":
+            let finishedRevision = sessionRouter.revision(for: taskId)
             state.updateTask(id: taskId, state: .finished)
             // Claude Code sends "message"; Codex sends "last_assistant_message"
             let summary = (payload["message"] as? String)
@@ -239,7 +251,8 @@ final class HookServer: @unchecked Sendable {
                 setPillBadge(id: taskId, badge: .finished)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.2) {
-                if state.tasks.first(where: { $0.id == taskId })?.state == .finished {
+                if self.sessionRouter.revision(for: taskId) == finishedRevision,
+                   state.tasks.first(where: { $0.id == taskId })?.state == .finished {
                     state.updateTask(id: taskId, state: .idle)
                     self.clearPillBadge(id: taskId)
                 }
@@ -323,6 +336,27 @@ final class HookServer: @unchecked Sendable {
             return
         }
 
+        // A second request is left to the agent's native approval prompt.
+        // It cannot change either the visible card or the selected session.
+        if approvalSlot.isOccupied {
+            Task.detached { [weak self] in
+                self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
+                close(fd)
+            }
+            return
+        }
+        let currentlyActive = state.tasks.first(where: { $0.id == taskId })
+            .map { $0.state != .idle && $0.state != .finished && $0.state != .error } ?? false
+        guard sessionRouter.accepts(taskId: taskId, sessionId: sessionId,
+                                    turnId: payload["turn_id"] as? String,
+                                    event: "PermissionRequest", currentlyActive: currentlyActive) else {
+            Task.detached { [weak self] in
+                self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
+                close(fd)
+            }
+            return
+        }
+
         let tool = payload["tool_name"] as? String ?? "Tool"
         var command = tool
         if let input = payload["tool_input"] as? [String: Any] {
@@ -331,23 +365,13 @@ final class HookServer: @unchecked Sendable {
         }
         nbLog("PermissionRequest [\(agent)] \(tool)")
 
-        if pendingApprovalFD >= 0 {
-            let old = pendingApprovalFD
-            let oldTaskId = pendingApprovalTaskId
-            Task.detached { [weak self] in
-                // "ask" → nb-hook outputs nothing → Claude Code re-asks
-                self?.sendLine(fd: old, text: #"{"permissionDecision":"ask"}"#)
-                close(old)
-            }
-            state.updateTask(id: oldTaskId, state: .working)
-            clearPillBadge(id: oldTaskId)
-        }
-        pendingApprovalFD = fd
-        pendingApprovalTaskId = taskId
+        guard let request = approvalSlot.open(fd: fd, taskId: taskId, sessionId: sessionId) else { return }
+        let requestId = request.id
 
         upsertTask(id: taskId, projectName: projectName, cwd: cwd)
         state.updateTask(id: taskId, state: .approval)
-        state.pendingApproval = ApprovalInfo(sessionId: sessionId, tool: tool, command: command)
+        state.pendingApproval = ApprovalInfo(requestId: requestId, taskId: taskId,
+                                             sessionId: sessionId, tool: tool, command: command)
         state.isPinned = true
         SoundEngine.shared.play("approval")
 
@@ -357,18 +381,19 @@ final class HookServer: @unchecked Sendable {
 
         let captured = fd
         DispatchQueue.main.asyncAfter(deadline: .now() + 115) { [weak self] in
-            guard let self, self.pendingApprovalFD == captured else { return }
+            guard let self, self.approvalSlot.matches(id: requestId, fd: captured) else { return }
             // "ask" → nb-hook outputs nothing → Claude Code re-asks rather than denying
-            self.sendApprovalDecision("ask")
+            self.sendApprovalDecision("ask", requestId: requestId)
         }
     }
 
     /// Called by ApprovalView buttons. Writes the decision to the waiting nb-hook and cleans up.
     @MainActor
-    func sendApprovalDecision(_ decision: String) {
-        let fd = pendingApprovalFD
-        pendingApprovalFD = -1
-        let taskId = pendingApprovalTaskId
+    func sendApprovalDecision(_ decision: String, requestId: UUID) {
+        guard AppState.shared.pendingApproval?.requestId == requestId,
+              let request = approvalSlot.take(id: requestId) else { return }
+        let fd = request.fd
+        let taskId = request.taskId
 
         let json: String
         switch decision {
@@ -668,9 +693,9 @@ final class HookServer: @unchecked Sendable {
         let hookPath = Self.hookScriptPath
         #if APPSTORE
         // Sandboxed apps create quarantined files; /bin/sh bypasses the quarantine flag
-        let quotedCmd = "/bin/sh \"\(hookPath.replacingOccurrences(of: "\"", with: "\\\""))\""
+        let quotedCmd = "/bin/sh \(HookCommand.quoted(hookPath))"
         #else
-        let quotedCmd = "\"\(hookPath.replacingOccurrences(of: "\"", with: "\\\""))\""
+        let quotedCmd = HookCommand.quoted(hookPath)
         #endif
         let events: [(String, Int)] = [
             ("SessionStart", 10), ("SessionEnd", 10),
@@ -725,10 +750,10 @@ final class HookServer: @unchecked Sendable {
     private func codexHookCommand(codexDir: URL) -> String {
         #if APPSTORE
         let path = codexDir.appendingPathComponent("coucou/nb-hook").path
-        return "/bin/sh \"\(path.replacingOccurrences(of: "\"", with: "\\\""))\" codex"
+        return "/bin/sh \(HookCommand.quoted(path)) codex"
         #else
         let path = Self.hookScriptPath
-        return "\"\(path.replacingOccurrences(of: "\"", with: "\\\""))\" codex"
+        return "\(HookCommand.quoted(path)) codex"
         #endif
     }
 
@@ -896,7 +921,7 @@ final class HookServer: @unchecked Sendable {
         }
         // Derive hook path from the panel-selected claudeURL (real ~/.claude, not container)
         let hookPath = claudeURL.appendingPathComponent("coucou/nb-hook").path
-        let quotedCmd = "/bin/sh \"\(hookPath.replacingOccurrences(of: "\"", with: "\\\""))\""
+        let quotedCmd = "/bin/sh \(HookCommand.quoted(hookPath))"
         let events: [(String, Int)] = [
             ("SessionStart", 10), ("SessionEnd", 10),
             ("UserPromptSubmit", 10),

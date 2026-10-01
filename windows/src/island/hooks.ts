@@ -7,17 +7,20 @@ import { Bridge, onEvent } from "../core/bridge";
 import { Sound } from "../core/sound";
 import { State } from "../core/state";
 import type { Island } from "./island";
+import { HookSessionRouter } from "./hookSafety";
 
 const CLAUDE_ID = "integration_claude";
 const CODEX_ID = "integration_codex";
 
 /** Clears the approval card if no decision was made before the hook gave up. */
 let pendingTimeout: number | null = null;
+const sessions = new HookSessionRouter();
 
 interface HookPayload {
   hook_event_name?: string;
   request_id?: string;
   session_id?: string;
+  turn_id?: string;
   cwd?: string;
   message?: string;
   /** UserPromptSubmit carries `prompt`; `message` belongs to Notification/Stop. */
@@ -198,12 +201,36 @@ function handleHook(island: Island, payload: HookPayload) {
 
   const name = payload.hook_event_name ?? "";
   // The relay tags every payload with coucou_agent; absent means Claude Code.
-  const isCodex = (payload.coucou_agent ?? "claude") === "codex";
+  const provider = payload.coucou_agent ?? "claude";
+  if (provider !== "claude" && provider !== "codex") {
+    if (payload.request_id) void Bridge.approvalDecline(payload.request_id);
+    return;
+  }
+  const isCodex = provider === "codex";
   const taskId = isCodex ? CODEX_ID : CLAUDE_ID;
+  const sessionId = payload.session_id ?? "unknown";
+  if (name !== "PermissionRequest" && State.pendingApproval?.taskId === taskId &&
+      State.pendingApproval.sessionId !== sessionId) return;
   const cwd = payload.cwd ?? "";
   const raw = lastPathComponent(cwd);
   const projectName = aliasProjectName(raw || "Session");
   const focused = State.focusId === taskId;
+  const currentState = taskState(taskId);
+  const currentlyActive = currentState !== undefined && !["idle", "finished", "error"].includes(currentState);
+  if (name !== "PermissionRequest" &&
+      !sessions.accepts(taskId, sessionId, payload.turn_id, name, currentlyActive)) return;
+  if (name !== "PermissionRequest" && State.pendingApproval?.taskId === taskId &&
+      ["UserPromptSubmit", "Stop", "Interrupt", "SessionEnd"].includes(name)) {
+    const requestId = State.pendingApproval.requestId;
+    if (pendingTimeout != null) window.clearTimeout(pendingTimeout);
+    pendingTimeout = null;
+    State.pendingApproval = null;
+    State.isPinned = false;
+    State.setPillBadge(taskId, null);
+    island.dropPin();
+    if (State.view === "approval") island.setView(State.defaultView());
+    if (requestId) void Bridge.approvalDecline(requestId);
+  }
 
   /** Alerts force the island open; work events only reveal the compact island. */
   const surface = (view: Parameters<Island["alert"]>[0], isAlert: boolean) => {
@@ -222,7 +249,7 @@ function handleHook(island: Island, payload: HookPayload) {
       // A real session start clears a pill left behind by a session that died
       // without Stop. Codex also fires SessionStart mid-turn when it compacts,
       // and that one must not interrupt a running turn.
-      if (payload.source !== "compact") State.updateTask(taskId, "idle");
+      if (payload.source !== "compact" && !currentlyActive) State.updateTask(taskId, "idle");
       surface("overview", false);
       Sound.play("work");
       break;
@@ -273,6 +300,7 @@ function handleHook(island: Island, payload: HookPayload) {
     }
 
     case "Stop":
+      const finishedRevision = sessions.revision(taskId);
       State.updateTask(taskId, "finished");
       // Claude Code sends `message`; Codex sends `last_assistant_message`.
       const said = payload.message ?? payload.last_assistant_message;
@@ -281,8 +309,10 @@ function handleHook(island: Island, payload: HookPayload) {
       if (focused) surface("finished", true);
       else State.setPillBadge(taskId, "finished");
       window.setTimeout(() => {
-        State.updateTask(taskId, "idle");
-        State.setPillBadge(taskId, null);
+        if (sessions.revision(taskId) === finishedRevision && taskState(taskId) === "finished") {
+          State.updateTask(taskId, "idle");
+          State.setPillBadge(taskId, null);
+        }
       }, 5200);
       break;
 
@@ -321,13 +351,18 @@ function handleHook(island: Island, payload: HookPayload) {
         if (requestId) void Bridge.approvalDecline(requestId);
         break;
       }
+      if (!sessions.accepts(taskId, sessionId, payload.turn_id, name, currentlyActive)) {
+        if (requestId) void Bridge.approvalDecline(requestId);
+        break;
+      }
       upsert(taskId, projectName, cwd);
       if (pendingTimeout != null) window.clearTimeout(pendingTimeout);
       const tool = payload.tool_name ?? "Tool";
       const input = payload.tool_input ?? {};
       State.pendingApproval = {
         requestId,
-        sessionId: payload.session_id ?? "",
+        taskId,
+        sessionId,
         tool,
         command: approvalTarget(tool, input),
       };
@@ -349,8 +384,8 @@ function handleHook(island: Island, payload: HookPayload) {
       // Coucou answers within 108 s or not at all; after that the terminal has
       // taken over and the card would be lying.
       pendingTimeout = window.setTimeout(() => {
+        if (State.pendingApproval?.requestId !== requestId) return;
         pendingTimeout = null;
-        if (!State.pendingApproval) return;
         State.pendingApproval = null;
         State.isPinned = false;
         island.dropPin();

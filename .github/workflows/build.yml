@@ -33,4 +33,6 @@ jobs:
             CODE_SIGNING_REQUIRED=NO
 
       - name: Codex hook regression checks
-        run: python3 tests/test_codex_hooks.py
+        run: |
+          python3 tests/test_codex_hooks.py
+          python3 tests/test_hook_safety.py
