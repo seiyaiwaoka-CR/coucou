@@ -31,6 +31,8 @@ enum BotEmote: String, CaseIterable {
 // MARK: - Approval info (pending PermissionRequest from Claude Code)
 
 struct ApprovalInfo: Sendable {
+    let requestId: UUID
+    let taskId: String
     var sessionId: String
     var tool: String
     var command: String
@@ -49,6 +51,7 @@ struct AgentTask: Identifiable, Equatable {
     var state: BotState
     var stepIndex: Int = 0
     var steps: [String]
+    var stepNotes: [String] = []   // full command / patch behind each step, shown in the step log
     var source: AgentSource
     var isIntegration: Bool = false  // true for persistent integration pills
     var emote: BotEmote? = nil
@@ -59,6 +62,7 @@ struct AgentTask: Identifiable, Equatable {
 
 enum AgentSource: Equatable {
     case claudeCode
+    case codex
     case n8n
 }
 

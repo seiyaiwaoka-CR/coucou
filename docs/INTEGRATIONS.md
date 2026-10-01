@@ -67,6 +67,61 @@ Demande l'autorisation Automatisation la première fois (normal).
 
 ---
 
+## 1bis. Codex (sessions de Louis)
+
+Règle d'or identique : **vérifier la doc officielle au moment d'implémenter**.
+- Hooks Codex : https://learn.chatgpt.com/docs/hooks
+- Emplacement des hooks : `hooks.json` dans le dossier Codex (`~/.codex` par défaut, `CODEX_HOME` si défini), ou tables `[hooks]` en ligne dans `config.toml`.
+
+### Architecture
+```
+codex (terminal, app Codex)
+  └─ hook "command" ─► nb-hook codex (même exécutable que pour Claude Code)
+                         └─ socket Unix ─► Notch Buddy.app
+                         ◄─ décision (pour PermissionRequest)
+```
+- **Même socket et même relais** que Claude Code. Le wrapper transmet `codex` au script Python ; ce dernier écrit `coucou_agent` dans le JSON et l'app route vers la pill `integration_codex`.
+- Coucou écrit **uniquement** `hooks.json` dans le dossier Codex choisi (fusion + sauvegarde datée + JSON montré avant écriture). Il ne touche **jamais** `config.toml` ; il refuse un JSON invalide ou un fichier modifié depuis la prévisualisation.
+- Si l'app ne répond pas, `nb-hook` sort en code 0 sans rien écrire : Codex n'est jamais bloqué.
+
+### Événements branchés et état du bonhomme
+| Hook | Effet dans l'app |
+|---|---|
+| `SessionStart` | crée/renomme la tâche (nom = dossier), état `idle`, son `work` |
+| `UserPromptSubmit` | état `thinking`, ligne du défilé = début du prompt |
+| `PreToolUse` | état `working`, ligne = outil + cible (`apply_patch` → « Modifie · fichier ») |
+| `PostToolUse` | met à jour la ligne, reste `working` |
+| `PermissionRequest` | alerte `approval` (voir plus bas) |
+| `Stop` | état `finished` → vue `finished` 5,2 s, résumé = `last_assistant_message` |
+| `SubagentStart` / `SubagentStop` | « + sous-agent » / « • sous-agent terminé » |
+| `Interrupt` | état `idle`, ligne « Interrompu » |
+| `SessionEnd` | remet la tâche à zéro (nom remis à « Codex ») |
+
+Timeouts écrits dans `hooks.json` : 10 s partout, 3 s pour `SessionEnd` et `Interrupt` (plafond Codex), 130 s pour `PermissionRequest`.
+
+### Ce que Codex ne fournit pas (états absents, pas « à faire »)
+- Pas d'événement `Notification` : ni détection de limite d'usage (`ratelimit`), ni question posée.
+- Pas de `StopFailure` : une erreur d'agent n'a pas d'alerte `error` dédiée.
+- Pas d'équivalent `AskUserQuestion` : la vue `question` reste réservée à Claude Code.
+
+### Approuver depuis le notch
+- Sur `PermissionRequest`, `nb-hook` **attend** la décision de l'app puis écrit sur stdout `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow|deny"}}}`.
+- Codex affiche seulement **Allow** et **Deny**. Les règles persistantes se gèrent dans Codex ; `PermissionRequest` n'accepte pas `updatedPermissions` ni `updatedInput`.
+- Pas de réponse dans le délai, app fermée, ou décision `ask` → aucune sortie : Codex garde son invite d'approbation normale.
+- Sur `PreToolUse`, `permissionDecision: ask` n'est pas supporté par Codex (l'appel de hook échoue sans bloquer l'outil) : ne pas s'en servir.
+
+### Installation des hooks : procédure obligatoire
+1. Lire `hooks.json` dans le dossier Codex (le créer s'il n'existe pas).
+2. Copier le fichier existant en `hooks.json.bak-AAAAMMJJ-HHMMSS-<suffixe>` avant toute écriture.
+3. **Fusionner** : ajouter les matchers Notch Buddy sans toucher aux autres hooks ; ne retirer que nos propres entrées.
+4. Montrer le JSON à Louis, attendre son OK, écrire.
+5. Bouton « Uninstall » dans les réglages qui retire uniquement les entrées Notch Buddy.
+6. **Étape utilisateur obligatoire** : les hooks non gérés doivent être relus et approuvés dans `/hooks` dans Codex. Tant qu'ils ne le sont pas, Codex les ignore.
+
+### Vérification locale
+- Contrôles isolés : relais shell/Python avec faux socket pour Allow, Deny et app indisponible ; fusion et retrait de hooks sur fixtures JSON ; typecheck Swift des deux variantes.
+- Les essais Codex CLI 0.146.0 et desktop 0.155.0-alpha décrits par l'auteur de la PR d'origine ne constituent pas une validation indépendante de cette intégration. L'utilisation dans la vraie app et le dialogue d'approbation restent à vérifier après compilation et installation par l'utilisateur.
+
 ## 2. n8n (workflows de Louis)
 
 - Réglages : URL de l'instance (probablement `https://n8nlouis.dcsys.tech`, **à confirmer avec Louis**) et clé API n8n (Trousseau). La clé se crée dans n8n : Settings → n8n API.

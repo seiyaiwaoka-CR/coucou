@@ -114,6 +114,25 @@ fn decision_json(decision: &str) -> Option<String> {
 }
 
 /// Reads stdin and returns the payload to forward plus the event name.
+fn agent_and_event(args: &[String]) -> Option<(String, String)> {
+    match args.first().map(String::as_str) {
+        Some("--agent") => {
+            let agent = args.get(1)?.as_str();
+            if agent != "claude" && agent != "codex" { return None; }
+            Some((agent.to_string(), args.get(2).cloned().unwrap_or_default()))
+        }
+        Some("codex") | Some("claude") =>
+            Some((args[0].clone(), args.get(1).cloned().unwrap_or_default())),
+        None => Some(("claude".to_string(), String::new())),
+        Some(event) if matches!(event,
+            "SessionStart" | "SessionEnd" | "UserPromptSubmit" | "PreToolUse" |
+            "PostToolUse" | "PostToolUseFailure" | "PermissionRequest" |
+            "Notification" | "Stop" | "StopFailure" | "SubagentStart" | "SubagentStop"
+        ) => Some(("claude".to_string(), event.to_string())),
+        _ => None,
+    }
+}
+
 fn read_event() -> Option<(String, String)> {
     let mut raw = Vec::new();
     if std::io::stdin().read_to_end(&mut raw).is_err() || raw.is_empty() {
@@ -127,9 +146,12 @@ fn read_event() -> Option<(String, String)> {
     let mut payload = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
     let map = payload.as_object_mut()?;
 
-    // The event name is passed as argv[1] by the hook command; the JSON usually
-    // carries it too. Trust argv when the JSON is missing it.
-    let arg_event = std::env::args().nth(1).unwrap_or_default();
+    // argv carries whatever the hook command passed: the event name for Claude Code
+    // ("coucou-hook.exe PreToolUse"), or the agent for Codex
+    // ("coucou-hook.exe --agent codex"). The JSON normally carries the event too,
+    // and it wins when present.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (agent, arg_event) = agent_and_event(&args)?;
     let event = map
         .get("hook_event_name")
         .and_then(|v| v.as_str())
@@ -137,6 +159,9 @@ fn read_event() -> Option<(String, String)> {
         .filter(|s| !s.is_empty())
         .unwrap_or(arg_event);
     map.insert("hook_event_name".into(), serde_json::Value::String(event.clone()));
+
+    // The command, never stdin JSON, owns the provider tag. Legacy commands are Claude.
+    map.insert("coucou_agent".into(), serde_json::Value::String(agent));
 
     for field in DROPPED_FIELDS {
         map.remove(*field);
@@ -232,6 +257,19 @@ fn talk(payload: &str, waits_for_answer: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_is_bound_to_hook_command() {
+        assert_eq!(agent_and_event(&[]), Some(("claude".into(), "".into())));
+        assert_eq!(agent_and_event(&["PreToolUse".into()]),
+                   Some(("claude".into(), "PreToolUse".into())));
+        assert_eq!(agent_and_event(&["--agent".into(), "codex".into()]),
+                   Some(("codex".into(), "".into())));
+        assert_eq!(agent_and_event(&["codex".into()]), Some(("codex".into(), "".into())));
+        assert!(agent_and_event(&["--agent".into(), "garbage".into()]).is_none());
+        assert!(agent_and_event(&["--agent".into()]).is_none());
+        assert!(agent_and_event(&["garbage".into()]).is_none());
+    }
 
     #[test]
     fn decision_json_matches_the_documented_shape() {
