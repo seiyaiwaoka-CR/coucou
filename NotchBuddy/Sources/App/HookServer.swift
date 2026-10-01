@@ -777,19 +777,16 @@ final class HookServer: @unchecked Sendable {
     }
 
     private func writeCodexHooksFile(data: Data, codexDir: URL) throws {
-        try FileManager.default.createDirectory(at: codexDir, withIntermediateDirectories: true)
         let hooksURL = codexDir.appendingPathComponent("hooks.json")
-        guard codexDir.standardizedFileURL == _pendingCodexDir?.standardizedFileURL,
-              try readExisting(hooksURL) == _pendingCodexOriginalData else {
+        guard codexDir.standardizedFileURL == _pendingCodexDir?.standardizedFileURL else {
             throw CodexHooksConfig.ConfigError.changedSincePreview
         }
-        try backupIfExisting(hooksURL)
-        try data.write(to: hooksURL, options: .atomic)
+        try CodexHooksConfig.writeReviewed(data, original: _pendingCodexOriginalData, to: hooksURL)
     }
 
     private func buildCodexHooksData(codexDir: URL) throws -> Data {
         let hooksURL = codexDir.appendingPathComponent("hooks.json")
-        let original = try readExisting(hooksURL)
+        let original = try CodexHooksConfig.readExisting(at: hooksURL)
         let result = try CodexHooksConfig.merged(existing: original, command: codexHookCommand(codexDir: codexDir))
         _pendingCodexHooksData = result
         _pendingCodexOriginalData = original
@@ -799,30 +796,10 @@ final class HookServer: @unchecked Sendable {
 
     /// Removes only the Coucou matchers from a hooks.json file, leaving other hooks untouched.
     private func removeCoucouHooks(at hooksURL: URL) throws {
-        guard let data = try readExisting(hooksURL) else { return }
-        let newData = try CodexHooksConfig.removing(
-            existing: data,
+        try CodexHooksConfig.removeInstalled(
+            at: hooksURL,
             command: codexHookCommand(codexDir: hooksURL.deletingLastPathComponent())
         )
-        try backupIfExisting(hooksURL)
-        try newData.write(to: hooksURL, options: .atomic)
-    }
-
-    private func readExisting(_ url: URL) throws -> Data? {
-        do { return try Data(contentsOf: url) }
-        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
-            return nil
-        }
-    }
-
-    private func backupIfExisting(_ url: URL) throws {
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        let backupURL = url.deletingLastPathComponent().appendingPathComponent(
-            "hooks.json.bak-\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(8))"
-        )
-        try FileManager.default.copyItem(at: url, to: backupURL)
     }
 
     // MARK: - App Store: hooks via security-scoped bookmark

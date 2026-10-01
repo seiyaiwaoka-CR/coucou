@@ -70,6 +70,37 @@ enum CodexHooksConfig {
         return try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
     }
 
+    static func readExisting(at url: URL) throws -> Data? {
+        do { return try Data(contentsOf: url) }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+            return nil
+        }
+    }
+
+    /// Writes only the bytes that were reviewed. A concurrent edit requires another preview.
+    static func writeReviewed(_ data: Data, original: Data?, to url: URL) throws {
+        guard try readExisting(at: url) == original else { throw ConfigError.changedSincePreview }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try backupIfExisting(at: url)
+        try data.write(to: url, options: .atomic)
+    }
+
+    static func removeInstalled(at url: URL, command: String) throws {
+        guard let original = try readExisting(at: url) else { return }
+        let updated = try removing(existing: original, command: command)
+        try writeReviewed(updated, original: original, to: url)
+    }
+
+    private static func backupIfExisting(at url: URL) throws {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let backup = url.deletingLastPathComponent().appendingPathComponent(
+            "hooks.json.bak-\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(8))"
+        )
+        try FileManager.default.copyItem(at: url, to: backup)
+    }
+
     private static func parse(_ data: Data?) throws -> ([String: Any], [String: Any]) {
         guard let data else { return ([:], [:]) }
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {

@@ -141,6 +141,29 @@ let left = (parse(removed)["hooks"] as! [String: Any])["SessionStart"] as! [[Str
 precondition(left.count == 1)
 precondition(((left[0]["hooks"] as! [[String: Any]])[0]["command"] as! String) == foreign)
 precondition(!CodexHooksConfig.containsManagedHook(removed, command: own))
+let configDir = URL(fileURLWithPath: CommandLine.arguments[1])
+let configURL = configDir.appendingPathComponent("hooks.json")
+try input.write(to: configURL)
+try CodexHooksConfig.writeReviewed(merged, original: input, to: configURL)
+let written = try Data(contentsOf: configURL)
+precondition(written == merged)
+let firstBackup = try FileManager.default.contentsOfDirectory(atPath: configDir.path)
+    .filter { $0.hasPrefix("hooks.json.bak-") }
+precondition(firstBackup.count == 1)
+let backupContents = try Data(contentsOf: configDir.appendingPathComponent(firstBackup[0]))
+precondition(backupContents == input)
+do {
+    try CodexHooksConfig.writeReviewed(removed, original: input, to: configURL)
+    fatalError("overwrote an edit made after preview")
+} catch CodexHooksConfig.ConfigError.changedSincePreview { }
+let stillWritten = try Data(contentsOf: configURL)
+precondition(stillWritten == merged)
+try CodexHooksConfig.removeInstalled(at: configURL, command: own)
+let afterRemoval = try Data(contentsOf: configURL)
+precondition(!CodexHooksConfig.containsManagedHook(afterRemoval, command: own))
+let backups = try FileManager.default.contentsOfDirectory(atPath: configDir.path)
+    .filter { $0.hasPrefix("hooks.json.bak-") }
+precondition(backups.count == 2)
 for malformed in [Data("{".utf8), Data("{\\\"hooks\\\":[]}".utf8)] {
     do { _ = try CodexHooksConfig.merged(existing: malformed, command: own); fatalError("accepted malformed config") }
     catch CodexHooksConfig.ConfigError.invalidJSON { }
@@ -167,7 +190,7 @@ print("Codex config fixture checks passed")
                         if compile_result.returncode == 0:
                             break
             self.assertEqual(0, compile_result.returncode, compile_result.stderr)
-            result = subprocess.run([str(executable)], text=True, capture_output=True, check=False, timeout=5)
+            result = subprocess.run([str(executable), temp], text=True, capture_output=True, check=False, timeout=5)
             self.assertEqual(0, result.returncode, result.stderr)
 
 
