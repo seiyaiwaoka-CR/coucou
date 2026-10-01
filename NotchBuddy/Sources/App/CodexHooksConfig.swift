@@ -27,13 +27,14 @@ enum CodexHooksConfig {
         }
     }
 
-    static func isManaged(_ command: String, expected: String) -> Bool {
+    static func isManaged(_ command: String, expected: String, legacyCommands: [String] = []) -> Bool {
         // The first PR used a direct App Store script without /bin/sh. Recognize that
         // exact old command as well so an update or uninstall can clean it up.
-        command == expected || (expected.hasPrefix("/bin/sh ") && command == String(expected.dropFirst(8)))
+        command == expected || legacyCommands.contains(command) ||
+            (expected.hasPrefix("/bin/sh ") && command == String(expected.dropFirst(8)))
     }
 
-    static func containsManagedHook(_ data: Data?, command: String) -> Bool {
+    static func containsManagedHook(_ data: Data?, command: String, legacyCommands: [String] = []) -> Bool {
         guard let data,
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let hooks = root["hooks"] as? [String: Any] else { return false }
@@ -41,16 +42,17 @@ enum CodexHooksConfig {
             guard let matchers = value as? [[String: Any]] else { return false }
             return matchers.contains { matcher in
                 guard let entries = matcher["hooks"] as? [[String: Any]] else { return false }
-                return entries.contains { isManaged($0["command"] as? String ?? "", expected: command) }
+                return entries.contains { isManaged($0["command"] as? String ?? "", expected: command,
+                                            legacyCommands: legacyCommands) }
             }
         }
     }
 
-    static func merged(existing: Data?, command: String) throws -> Data {
+    static func merged(existing: Data?, command: String, legacyCommands: [String] = []) throws -> Data {
         var (root, hooks) = try parse(existing)
         for event in events {
             var matchers = try matcherList(hooks[event.name])
-            matchers = removingManaged(from: matchers, command: command)
+            matchers = removingManaged(from: matchers, command: command, legacyCommands: legacyCommands)
             matchers.append(["hooks": [["type": "command", "command": command, "timeout": event.timeout]]])
             hooks[event.name] = matchers
         }
@@ -58,10 +60,11 @@ enum CodexHooksConfig {
         return try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
     }
 
-    static func removing(existing: Data, command: String) throws -> Data {
+    static func removing(existing: Data, command: String, legacyCommands: [String] = []) throws -> Data {
         var (root, hooks) = try parse(existing)
         for (event, value) in hooks {
-            let matchers = removingManaged(from: try matcherList(value), command: command)
+            let matchers = removingManaged(from: try matcherList(value), command: command,
+                                            legacyCommands: legacyCommands)
             if matchers.isEmpty { hooks.removeValue(forKey: event) }
             else { hooks[event] = matchers }
         }
@@ -85,9 +88,9 @@ enum CodexHooksConfig {
         try data.write(to: url, options: .atomic)
     }
 
-    static func removeInstalled(at url: URL, command: String) throws {
+    static func removeInstalled(at url: URL, command: String, legacyCommands: [String] = []) throws {
         guard let original = try readExisting(at: url) else { return }
-        let updated = try removing(existing: original, command: command)
+        let updated = try removing(existing: original, command: command, legacyCommands: legacyCommands)
         try writeReviewed(updated, original: original, to: url)
     }
 
@@ -123,10 +126,12 @@ enum CodexHooksConfig {
         return matchers
     }
 
-    private static func removingManaged(from matchers: [[String: Any]], command: String) -> [[String: Any]] {
+    private static func removingManaged(from matchers: [[String: Any]], command: String,
+                                        legacyCommands: [String]) -> [[String: Any]] {
         matchers.compactMap { matcher in
             guard let entries = matcher["hooks"] as? [[String: Any]] else { return matcher }
-            let remaining = entries.filter { !isManaged($0["command"] as? String ?? "", expected: command) }
+            let remaining = entries.filter { !isManaged($0["command"] as? String ?? "", expected: command,
+                                                       legacyCommands: legacyCommands) }
             guard !remaining.isEmpty else { return nil }
             var kept = matcher
             kept["hooks"] = remaining

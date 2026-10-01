@@ -6,4 +6,10 @@ enum HookCommand {
     static func quoted(_ path: String) -> String {
         "'" + path.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
+
+    /// Exact command forms emitted before POSIX quoting was adopted.
+    static func legacyCodexCommands(for path: String) -> [String] {
+        let old = "\"" + path.replacingOccurrences(of: "\"", with: "\\\"") + "\" codex"
+        return [old, "/bin/sh " + old]
+    }
 }

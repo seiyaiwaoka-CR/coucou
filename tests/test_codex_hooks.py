@@ -141,6 +141,28 @@ let left = (parse(removed)["hooks"] as! [String: Any])["SessionStart"] as! [[Str
 precondition(left.count == 1)
 precondition(((left[0]["hooks"] as! [[String: Any]])[0]["command"] as! String) == foreign)
 precondition(!CodexHooksConfig.containsManagedHook(removed, command: own))
+// Upgrade the exact double-quoted commands emitted before shell-safe quoting.
+let specialPath = #"/tmp/Coucou/$(printf BAD)`printf BAD`/odd'and\"quoted/nb-hook"#
+let safeCommand = HookCommand.quoted(specialPath) + " codex"
+let legacy = HookCommand.legacyCodexCommands(for: specialPath)
+let foreignSpecial = "\\\"/tmp/foreign/nb-hook\\\" codex"
+let oldRoot: [String: Any] = ["hooks": ["SessionStart": [["hooks": [
+    ["type": "command", "command": legacy[0]],
+    ["type": "command", "command": legacy[1]],
+    ["type": "command", "command": foreignSpecial],
+]]]]]
+let oldData = try JSONSerialization.data(withJSONObject: oldRoot)
+precondition(CodexHooksConfig.containsManagedHook(oldData, command: safeCommand, legacyCommands: legacy))
+let upgraded = try CodexHooksConfig.merged(existing: oldData, command: safeCommand, legacyCommands: legacy)
+let upgradeMatchers = (parse(upgraded)["hooks"] as! [String: Any])["SessionStart"] as! [[String: Any]]
+let upgradeEntries = upgradeMatchers.flatMap { $0["hooks"] as! [[String: Any]] }
+precondition(upgradeEntries.count == 2)
+precondition(upgradeEntries.contains { ($0["command"] as? String) == safeCommand })
+precondition(upgradeEntries.contains { ($0["command"] as? String) == foreignSpecial })
+let uninstalledOld = try CodexHooksConfig.removing(existing: oldData, command: safeCommand, legacyCommands: legacy)
+let oldLeft = (parse(uninstalledOld)["hooks"] as! [String: Any])["SessionStart"] as! [[String: Any]]
+precondition((oldLeft[0]["hooks"] as! [[String: Any]]).count == 1)
+precondition(((oldLeft[0]["hooks"] as! [[String: Any]])[0]["command"] as! String) == foreignSpecial)
 let configDir = URL(fileURLWithPath: CommandLine.arguments[1])
 let configURL = configDir.appendingPathComponent("hooks.json")
 try input.write(to: configURL)
@@ -164,6 +186,13 @@ precondition(!CodexHooksConfig.containsManagedHook(afterRemoval, command: own))
 let backups = try FileManager.default.contentsOfDirectory(atPath: configDir.path)
     .filter { $0.hasPrefix("hooks.json.bak-") }
 precondition(backups.count == 2)
+try oldData.write(to: configURL)
+try CodexHooksConfig.removeInstalled(at: configURL, command: safeCommand, legacyCommands: legacy)
+let removedLegacyFile = try Data(contentsOf: configURL)
+precondition(!CodexHooksConfig.containsManagedHook(removedLegacyFile, command: safeCommand,
+                                                    legacyCommands: legacy))
+let preserved = (parse(removedLegacyFile)["hooks"] as! [String: Any])["SessionStart"] as! [[String: Any]]
+precondition(((preserved[0]["hooks"] as! [[String: Any]])[0]["command"] as! String) == foreignSpecial)
 for malformed in [Data("{".utf8), Data("{\\\"hooks\\\":[]}".utf8)] {
     do { _ = try CodexHooksConfig.merged(existing: malformed, command: own); fatalError("accepted malformed config") }
     catch CodexHooksConfig.ConfigError.invalidJSON { }
@@ -175,6 +204,7 @@ print("Codex config fixture checks passed")
             compile_command = [
                 shutil.which("swiftc"),
                 str(ROOT / "NotchBuddy/Sources/App/CodexHooksConfig.swift"),
+                str(ROOT / "NotchBuddy/Sources/App/HookCommand.swift"),
                 str(harness), "-o", str(executable),
             ]
             compile_result = subprocess.run(compile_command, text=True, capture_output=True, check=False, timeout=90)

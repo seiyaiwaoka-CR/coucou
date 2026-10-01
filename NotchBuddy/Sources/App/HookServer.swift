@@ -747,14 +747,33 @@ final class HookServer: @unchecked Sendable {
     // Reminder for the user: Codex asks them to review and trust non-managed hooks with /hooks.
 
     /// The command Coucou installs: nb-hook plus the "codex" argument that tags every payload.
-    private func codexHookCommand(codexDir: URL) -> String {
+    private func codexHookScriptPath(codexDir: URL) -> String {
         #if APPSTORE
-        let path = codexDir.appendingPathComponent("coucou/nb-hook").path
-        return "/bin/sh \(HookCommand.quoted(path)) codex"
+        return codexDir.appendingPathComponent("coucou/nb-hook").path
         #else
-        let path = Self.hookScriptPath
-        return "\(HookCommand.quoted(path)) codex"
+        return Self.hookScriptPath
         #endif
+    }
+
+    private func codexHookCommand(codexDir: URL) -> String {
+        let quoted = HookCommand.quoted(codexHookScriptPath(codexDir: codexDir))
+        #if APPSTORE
+        return "/bin/sh \(quoted) codex"
+        #else
+        return "\(quoted) codex"
+        #endif
+    }
+
+    private func legacyCodexHookCommands(codexDir: URL) -> [String] {
+        var paths = [codexHookScriptPath(codexDir: codexDir)]
+        #if APPSTORE
+        // The first PR derived this path from the sandbox home rather than the
+        // folder selected in Settings. Remove that exact Coucou command too.
+        let originalPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/coucou/nb-hook").path
+        if !paths.contains(originalPath) { paths.append(originalPath) }
+        #endif
+        return paths.flatMap { HookCommand.legacyCodexCommands(for: $0) }
     }
 
     /// True when ~/.codex/hooks.json already routes Codex events to Coucou.
@@ -773,7 +792,8 @@ final class HookServer: @unchecked Sendable {
         #endif
         return CodexHooksConfig.containsManagedHook(
             try? Data(contentsOf: hooksURL),
-            command: shared.codexHookCommand(codexDir: dir)
+            command: shared.codexHookCommand(codexDir: dir),
+            legacyCommands: shared.legacyCodexHookCommands(codexDir: dir)
         )
     }
 
@@ -812,7 +832,9 @@ final class HookServer: @unchecked Sendable {
     private func buildCodexHooksData(codexDir: URL) throws -> Data {
         let hooksURL = codexDir.appendingPathComponent("hooks.json")
         let original = try CodexHooksConfig.readExisting(at: hooksURL)
-        let result = try CodexHooksConfig.merged(existing: original, command: codexHookCommand(codexDir: codexDir))
+        let result = try CodexHooksConfig.merged(existing: original,
+                                                 command: codexHookCommand(codexDir: codexDir),
+                                                 legacyCommands: legacyCodexHookCommands(codexDir: codexDir))
         _pendingCodexHooksData = result
         _pendingCodexOriginalData = original
         _pendingCodexDir = codexDir
@@ -823,7 +845,8 @@ final class HookServer: @unchecked Sendable {
     private func removeCoucouHooks(at hooksURL: URL) throws {
         try CodexHooksConfig.removeInstalled(
             at: hooksURL,
-            command: codexHookCommand(codexDir: hooksURL.deletingLastPathComponent())
+            command: codexHookCommand(codexDir: hooksURL.deletingLastPathComponent()),
+            legacyCommands: legacyCodexHookCommands(codexDir: hooksURL.deletingLastPathComponent())
         )
     }
 
